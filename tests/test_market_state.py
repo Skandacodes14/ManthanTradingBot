@@ -2,7 +2,7 @@ from collections import deque
 import unittest
 
 from market_state import MarketState
-from models import PriceTick
+from models import NewsFlash, PriceTick
 
 
 def candle(ticker: str, date: str, close: float) -> PriceTick:
@@ -94,6 +94,74 @@ class MarketStateHistoryBootstrapTests(unittest.TestCase):
             MarketState(history_days=0)
         with self.assertRaises(ValueError):
             MarketState(max_history=0)
+
+
+class MarketStateLiveEventTests(unittest.TestCase):
+    def test_on_tick_appends_normalized_candles_and_exposes_closes(self) -> None:
+        state = MarketState(max_history=2)
+
+        state.on_tick(candle(" abc ", "2026-01-01", 10.0))
+        state.on_tick(candle("ABC", "2026-01-02", 11.0))
+        state.on_tick(candle("ABC", "2026-01-03", 12.0))
+
+        self.assertEqual(state.get_closing_prices(" abc "), (11.0, 12.0))
+        self.assertEqual([tick.ticker for tick in state.price_history["ABC"]], ["ABC", "ABC"])
+
+    def test_on_tick_replaces_same_day_candle(self) -> None:
+        state = MarketState()
+
+        state.on_tick(candle("ABC", "2026-01-01", 10.0))
+        state.on_tick(candle("ABC", "2026-01-01", 11.0))
+
+        self.assertEqual(state.get_closing_prices("ABC"), (11.0,))
+
+    def test_date_rewind_resets_ticker_history_and_news(self) -> None:
+        state = MarketState()
+        state.on_tick(candle("ABC", "2026-01-03", 12.0))
+        state.on_news(NewsFlash("ABC", "Profit surge", "", "2026-01-03"))
+
+        state.on_tick(candle("ABC", "2026-01-01", 10.0))
+
+        self.assertEqual(state.get_closing_prices("ABC"), (10.0,))
+        self.assertIsNone(
+            state.get_latest_news("ABC", simulated_date="2026-01-01")
+        )
+
+    def test_on_news_returns_latest_flash_for_requested_date(self) -> None:
+        state = MarketState()
+        prior = NewsFlash("abc", "Prior headline", "", "2026-01-01")
+        current = NewsFlash("ABC", "Current headline", "", "2026-01-02")
+
+        state.on_news(prior)
+        state.on_news(current)
+
+        self.assertEqual(
+            state.get_latest_news("ABC", simulated_date="2026-01-01"),
+            NewsFlash("ABC", "Prior headline", "", "2026-01-01"),
+        )
+        self.assertEqual(state.get_latest_news("ABC"), current)
+
+    def test_live_handlers_reject_invalid_events(self) -> None:
+        state = MarketState()
+
+        with self.assertRaisesRegex(ValueError, "ticker must not be empty"):
+            state.on_tick(candle(" ", "2026-01-01", 10.0))
+        with self.assertRaisesRegex(ValueError, "OHLC prices"):
+            state.on_tick(candle("ABC", "2026-01-01", float("inf")))
+        with self.assertRaisesRegex(ValueError, "contain the open and close"):
+            state.on_tick(
+                PriceTick(
+                    ticker="ABC",
+                    open=10.0,
+                    high=9.0,
+                    low=8.0,
+                    close=10.0,
+                    volume=100,
+                    simulated_date="2026-01-01",
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "ticker must not be empty"):
+            state.on_news(NewsFlash("", "Headline", "", "2026-01-01"))
 
 
 if __name__ == "__main__":
