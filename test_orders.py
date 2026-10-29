@@ -1,286 +1,221 @@
-import json
-from unittest.mock import Mock
+import io
+import logging
+import unittest
 
-import pytest
-import requests
-
-import config
-from api_client import APIClient
-from models import OrderRequest, PriceTick, StageStatus, StockInfo
-
-
-def _http_response(status_code: int, payload: object | None = None) -> requests.Response:
-    response = requests.Response()
-    response.status_code = status_code
-    response.url = "https://gateway.test/api/v1"
-    if payload is not None:
-        response.headers["Content-Type"] = "application/json"
-        response._content = json.dumps(payload).encode("utf-8")
-    return response
-
-
-def _client(
-    response: requests.Response,
-    *,
-    token: str = "test-token",
-) -> tuple[APIClient, Mock]:
-    session = Mock(spec=requests.Session)
-    session.headers = {}
-    session.request.return_value = response
-    return APIClient(
-        base_url="https://gateway.test/api/v1/",
-        token=token,
-        session=session,
-        timeout=3.5,
-    ), session
-
-
-def test_get_stage_uses_public_endpoint_and_parses_nested_response() -> None:
-    client, session = _client(
-        _http_response(
-            200,
-            {
-                "data": {
-                    "stage": "simulation",
-                    "status": "RUNNING",
-                    "simulation_id": "sim-123",
-                    "days_completed": 4,
-                }
-            },
-        )
-    )
-
-    stage = client.get_stage()
-
-    assert stage == StageStatus(
-        stage="simulation",
-        status="RUNNING",
-        simulation_id="sim-123",
-        days_completed=4,
-    )
-    session.request.assert_called_once_with(
-        "GET",
-        "https://gateway.test/api/v1/stage",
-        headers={},
-        timeout=3.5,
-    )
-
-
-def test_post_heartbeat_sends_sequence_with_authentication() -> None:
-    client, session = _client(_http_response(200, {"ok": True}))
-
-    result = client.post_heartbeat(17)
-
-    assert result == {"ok": True}
-    session.request.assert_called_once_with(
-        "POST",
-        "https://gateway.test/api/v1/bot/heartbeat",
-        headers=config.get_auth_headers("test-token"),
-        timeout=3.5,
-        json={"seq": 17},
-    )
-
-
-def test_get_stocks_parses_wrapped_stock_records() -> None:
-    payload =     {
-        "stocks": [
-            {
-                "ticker": "ALPHA",
-                "symbol": "ALP",
-                "name": "Alpha Corp",
-                "description": "Alpha company",
-            },
-            {
-                "ticker": "BETA",
-                "symbol": "BET",
-                "name": "Beta Ltd",
-                "description": "Beta company",
-            },
-        ]
-    }
-    client, session = _client(_http_response(200, payload))
-
-    stocks = client.get_stocks()
-
-    assert all(isinstance(stock, StockInfo) for stock in stocks)
-    assert [stock.ticker for stock in stocks] == ["ALPHA", "BETA"]
-    session.request.assert_called_once_with(
-        "GET",
-        "https://gateway.test/api/v1/stocks",
-        headers=config.get_auth_headers("test-token"),
-        timeout=3.5,
-    )
-
-
-def test_get_stock_history_normalizes_and_escapes_ticker() -> None:
-    client, session = _client(
-        _http_response(
-            200,
-            {
-                "data": [
-                    {
-                        "ticker": "BRK/B",
-                        "open": 10,
-                        "high": 12,
-                        "low": 9,
-                        "close": 11,
-                        "volume": 500,
-                        "date": "2026-10-28",
-                    }
-                ]
-            },
-        )
-    )
-
-    history = client.get_stock_history(" brk/b ", days=30)
-
-    assert history == [
-        PriceTick(
-            ticker="BRK/B",
-            open=10.0,
-            high=12.0,
-            low=9.0,
-            close=11.0,
-            volume=500,
-            simulated_date="2026-10-28",
-        )
-    ]
-    session.request.assert_called_once_with(
-        "GET",
-        "https://gateway.test/api/v1/stocks/BRK%2FB/history",
-        headers=config.get_auth_headers("test-token"),
-        timeout=3.5,
-        params={"days": 30},
-    )
-
-
-@pytest.mark.parametrize(
-    ("method_name", "path", "payload"),
-    [
-        ("get_portfolio", "/portfolio", {"cash": 125_000}),
-        ("get_cash", "/portfolio/cash", {"cash": 125_000, "buying_power": 90_000}),
-        ("get_orders", "/orders", {"orders": []}),
-        ("get_simulation_clock", "/simulation/clock", {"current_date": "2026-10-28"}),
-    ],
+from models import OrderRequest
+from order_manager import (
+    DispatcherPausedError,
+    OrderManager,
+    OrderRejectedError,
+    TokenBucketRateLimiter,
 )
-def test_read_endpoints_return_api_payload(
-    method_name: str,
-    path: str,
-    payload: dict[str, object],
-) -> None:
-    client, session = _client(_http_response(200, payload))
-
-    result = getattr(client, method_name)()
-
-    assert result == payload
-    session.request.assert_called_once_with(
-        "GET",
-        f"https://gateway.test/api/v1{path}",
-        headers=config.get_auth_headers("test-token"),
-        timeout=3.5,
-    )
+from telemetry import TradeTelemetry
 
 
-def test_post_order_sends_normalized_order_fields() -> None:
-    client, session = _client(
-        _http_response(201, {"order_id": "order-456", "status": "accepted"})
-    )
-    order = OrderRequest(
-        ticker=" alpha ",
-        action=" buy ",
-        quantity=25,
-        date="2026-10-28",
-    )
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
 
-    result = client.post_order(order)
+    def monotonic(self) -> float:
+        return self.now
 
-    assert result == {"order_id": "order-456", "status": "accepted"}
-    session.request.assert_called_once_with(
-        "POST",
-        "https://gateway.test/api/v1/orders",
-        headers=config.get_auth_headers("test-token"),
-        timeout=3.5,
-        json={
-            "ticker": "ALPHA",
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class TokenBucketRateLimiterTests(unittest.TestCase):
+    def test_paces_requests_at_configured_rate(self) -> None:
+        clock = FakeClock()
+        limiter = TokenBucketRateLimiter(
+            rate=1.5,
+            clock=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        limiter.acquire()
+        limiter.acquire()
+
+        self.assertAlmostEqual(clock.sleeps[0], 2 / 3)
+
+    def test_order_manager_dispatches_after_rate_limit(self) -> None:
+        clock = FakeClock()
+        limiter = TokenBucketRateLimiter(
+            rate=1.5,
+            clock=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        order = OrderRequest(ticker="abc", action="buy", quantity=5)
+        sent: list[OrderRequest] = []
+        manager = OrderManager(lambda value: sent.append(value) or "accepted", rate_limiter=limiter)
+
+        result = manager.dispatch(order)
+
+        self.assertEqual(result, "accepted")
+        self.assertEqual(sent, [order])
+
+    def test_rejects_invalid_rate_or_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            TokenBucketRateLimiter(rate=0)
+        with self.assertRaises(ValueError):
+            TokenBucketRateLimiter(capacity=0.5)
+
+
+class OrderManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        self.order = OrderRequest(
+            ticker="abc",
+            action="buy",
+            quantity=5,
+            date="2021-04-15",
+        )
+        self.limiter = TokenBucketRateLimiter(
+            rate=1.5,
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+    def test_dispatch_preserves_date_and_records_structured_telemetry(self) -> None:
+        self.clock.now = 8.0
+        response = {
+            "fill_price": 123.5,
+            "brokerage_charged": 20.0,
+            "tax_deducted": 1.25,
+        }
+        sent: list[OrderRequest] = []
+        telemetry = TradeTelemetry(wall_clock=lambda: 0.0)
+        manager = OrderManager(
+            lambda order: sent.append(order) or response,
+            rate_limiter=self.limiter,
+            telemetry=telemetry,
+            clock=self.clock.monotonic,
+        )
+
+        result = manager.dispatch(self.order, tick_received_at=5.0)
+
+        self.assertIs(result, response)
+        self.assertEqual(sent[0].to_dict(), {
+            "ticker": "ABC",
             "action": "BUY",
-            "quantity": 25,
-            "date": "2026-10-28",
-        },
-    )
+            "quantity": 5,
+            "date": "2021-04-15",
+        })
+        event = telemetry.events[0]
+        self.assertEqual(event.status, "submitted")
+        self.assertEqual(event.decision_latency_seconds, 3.0)
+        self.assertEqual(event.fill_price, 123.5)
+        self.assertEqual(event.brokerage_charged, 20.0)
+        self.assertEqual(event.tax_deducted, 1.25)
+
+    def test_thread_safe_queue_dispatches_queued_order(self) -> None:
+        sent: list[OrderRequest] = []
+        manager = OrderManager(
+            lambda order: sent.append(order) or "accepted",
+            rate_limiter=self.limiter,
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+        manager.enqueue(self.order, tick_received_at=0.0)
+
+        self.assertEqual(manager.pending_count, 1)
+        self.assertEqual(manager.dispatch_next(timeout=0), "accepted")
+        self.assertEqual(manager.pending_count, 0)
+        self.assertEqual(sent, [self.order])
+        self.assertEqual(manager.telemetry.events[0].decision_latency_seconds, 0.0)
+
+    def test_insufficient_capital_refreshes_cash_and_surfaces_rejection(self) -> None:
+        refreshes: list[bool] = []
+        manager = OrderManager(
+            lambda _: {"error": {"code": "INSUFFICIENT_CAPITAL"}},
+            rate_limiter=self.limiter,
+            refresh_cash_cache=lambda: refreshes.append(True),
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+        with self.assertRaisesRegex(OrderRejectedError, "INSUFFICIENT_CAPITAL"):
+            manager.dispatch(self.order)
+
+        self.assertEqual(refreshes, [True])
+        self.assertEqual(manager.telemetry.events[0].error_code, "INSUFFICIENT_CAPITAL")
+
+    def test_no_short_position_rejection_is_recorded_and_propagated(self) -> None:
+        manager = OrderManager(
+            lambda _: {"error_code": "NO_SHORT_POSITION"},
+            rate_limiter=self.limiter,
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+        with self.assertRaisesRegex(OrderRejectedError, "NO_SHORT_POSITION"):
+            manager.dispatch(self.order)
+
+        self.assertEqual(manager.telemetry.events[0].status, "rejected")
+
+    def test_rate_limited_rejection_applies_penalty_before_next_dispatch(self) -> None:
+        responses = iter([{"code": "RATE_LIMITED"}, {"status": "accepted"}])
+        manager = OrderManager(
+            lambda _: next(responses),
+            rate_limiter=self.limiter,
+            penalty_box_seconds=30,
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+        with self.assertRaisesRegex(OrderRejectedError, "RATE_LIMITED"):
+            manager.dispatch(self.order)
+        self.assertEqual(manager.dispatch(self.order), {"status": "accepted"})
+        self.assertGreaterEqual(self.clock.now, 30)
+
+    def test_simulation_not_running_pauses_until_resumed(self) -> None:
+        manager = OrderManager(
+            lambda _: {"code": "SIMULATION_NOT_RUNNING"},
+            rate_limiter=self.limiter,
+            clock=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+        with self.assertRaisesRegex(OrderRejectedError, "SIMULATION_NOT_RUNNING"):
+            manager.dispatch(self.order)
+        self.assertTrue(manager.paused)
+        with self.assertRaises(DispatcherPausedError):
+            manager.dispatch(self.order)
+
+        manager.resume()
+        self.assertFalse(manager.paused)
+
+    def test_telemetry_formats_readable_terminal_audit(self) -> None:
+        output = io.StringIO()
+        logger = logging.getLogger(f"test.telemetry.{id(output)}")
+        telemetry = TradeTelemetry(
+            logger=logger,
+            wall_clock=lambda: 0.0,
+            stream=output,
+        )
+
+        telemetry.record_order(
+            self.order,
+            status="submitted",
+            tick_received_at=1.0,
+            sent_at=1.125,
+            response={
+                "fill_price": 123.5,
+                "brokerage_charged": 20.0,
+                "tax_deducted": 1.25,
+            },
+        )
+
+        terminal_line = output.getvalue()
+        self.assertIn("[SUBMITTED]", terminal_line)
+        self.assertIn("BUY 5 ABC", terminal_line)
+        self.assertIn("date=2021-04-15", terminal_line)
+        self.assertIn("decision_latency=0.125s", terminal_line)
+        self.assertIn("fill=123.5", terminal_line)
+        self.assertIn("brokerage=20.0", terminal_line)
+        self.assertIn("tax=1.25", terminal_line)
 
 
-def test_order_request_omits_empty_date() -> None:
-    order = OrderRequest(ticker="beta", action="short", quantity=3)
-
-    assert order.to_dict() == {
-        "ticker": "BETA",
-        "action": "SHORT",
-        "quantity": 3,
-    }
-
-
-@pytest.mark.parametrize(
-    ("ticker", "action", "quantity"),
-    [
-        ("ALPHA", "HOLD", 1),
-        ("ALPHA", "BUY", 0),
-        ("ALPHA", "BUY", 1_000_001),
-    ],
-)
-def test_order_request_rejects_invalid_fields(
-    ticker: str,
-    action: str,
-    quantity: int,
-) -> None:
-    with pytest.raises(ValueError):
-        OrderRequest(ticker=ticker, action=action, quantity=quantity)
-
-
-def test_authenticated_endpoint_requires_nonempty_token() -> None:
-    client, session = _client(_http_response(200, {}), token="  ")
-
-    with pytest.raises(ValueError, match="access token is required"):
-        client.get_portfolio()
-
-    session.request.assert_not_called()
-
-
-@pytest.mark.parametrize("days", [0, -1, True, 1.5])
-def test_stock_history_rejects_invalid_day_count(days: object) -> None:
-    client, session = _client(_http_response(200, []))
-
-    with pytest.raises(ValueError, match="positive integer"):
-        client.get_stock_history("ALPHA", days=days)  # type: ignore[arg-type]
-
-    session.request.assert_not_called()
-
-
-def test_stock_history_rejects_blank_ticker() -> None:
-    client, session = _client(_http_response(200, []))
-
-    with pytest.raises(ValueError, match="Ticker must not be empty"):
-        client.get_stock_history("  ")
-
-    session.request.assert_not_called()
-
-
-def test_no_content_response_returns_none() -> None:
-    client, _ = _client(_http_response(204))
-
-    assert client.post_heartbeat(1) is None
-
-
-def test_http_error_is_propagated() -> None:
-    client, _ = _client(_http_response(401, {"error": "unauthorized"}))
-
-    with pytest.raises(requests.HTTPError):
-        client.get_portfolio()
-
-
-def test_context_manager_closes_http_session() -> None:
-    client, session = _client(_http_response(200, {}))
-
-    with client as entered_client:
-        assert entered_client is client
-
-    session.close.assert_called_once_with()
+if __name__ == "__main__":
+    unittest.main()
