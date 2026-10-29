@@ -56,8 +56,15 @@ class APIClient:
 
     @staticmethod
     def _list_payload(payload: Any, resource: str) -> list[dict[str, Any]]:
-        if isinstance(payload, dict):
-            payload = payload.get(resource, payload.get("data"))
+        while isinstance(payload, dict):
+            if resource in payload:
+                payload = payload[resource]
+            elif resource == "history" and "prices" in payload:
+                payload = payload["prices"]
+            elif "data" in payload:
+                payload = payload["data"]
+            else:
+                break
         if not isinstance(payload, list) or not all(
             isinstance(item, dict) for item in payload
         ):
@@ -99,10 +106,12 @@ class APIClient:
             f"/stocks/{path_ticker}/history",
             params={"days": days},
         )
-        return [
-            PriceTick.from_dict(item)
-            for item in self._list_payload(payload, "history")
-        ]
+        history: list[PriceTick] = []
+        for item in self._list_payload(payload, "history"):
+            record = dict(item)
+            record.setdefault("ticker", normalized_ticker)
+            history.append(PriceTick.from_dict(record))
+        return history
 
     def get_portfolio(self) -> Any:
         """Return the current portfolio response."""
