@@ -1,0 +1,2 @@
+# ManthanTradingBot
+Trading bot
