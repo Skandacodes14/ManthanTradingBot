@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from threading import Event
+import time
 from typing import Any, Protocol
 
 import config
@@ -28,6 +30,8 @@ class KafkaMessage(Protocol):
 
 class KafkaConsumerHandle(Protocol):
     def __iter__(self) -> Any: ...
+
+    def poll(self, timeout_ms: int = 1000) -> Mapping[Any, Sequence[Any]]: ...
 
     def commit(self) -> Any: ...
 
@@ -65,6 +69,7 @@ class KafkaMarketDataConsumer:
         self.broker = broker
         self.group_id = group_id
         self.consumer_factory = consumer_factory
+        self._acknowledged_preflight_sequences: set[int] = set()
 
     def _create_consumer(self) -> KafkaConsumerHandle:
         factory = self.consumer_factory
@@ -100,14 +105,22 @@ class KafkaMarketDataConsumer:
                     raise ValueError("Preflight tick is missing its sequence ID.")
 
                 preflight_tick = PreflightTick.from_dict(payload)
-                self.api_client.post_heartbeat(preflight_tick.seq)
-                logger.info("Acknowledged preflight heartbeat seq=%s", preflight_tick.seq)
+                if preflight_tick.seq not in self._acknowledged_preflight_sequences:
+                    self.api_client.post_heartbeat(preflight_tick.seq)
+                    self._acknowledged_preflight_sequences.add(preflight_tick.seq)
+                    logger.info(
+                        "Acknowledged preflight heartbeat seq=%s",
+                        preflight_tick.seq,
+                    )
                 return
 
             if event_type == "price_tick":
                 self.market_state.on_tick(PriceTick.from_dict(payload))
                 return
 
+        elif message.topic == config.KAFKA_TOPIC_NEWS and event_type == "preflight_news":
+            logger.debug("Ignoring preflight news event.")
+            return
         elif message.topic == config.KAFKA_TOPIC_NEWS and event_type == "news_flash":
             self.market_state.on_news(NewsFlash.from_dict(payload))
             return
@@ -118,9 +131,30 @@ class KafkaMarketDataConsumer:
             event_type,
         )
 
-    def run(self) -> None:
-        """Consume continuously, committing each message only after handling it."""
-        consumer = self._create_consumer()
+    def run(self, stop_event: Event | None = None) -> None:
+        """Consume until stopped, committing each message only after handling it."""
+        consumer: KafkaConsumerHandle | None = None
+        retry_delay = 1.0
+        while stop_event is None or not stop_event.is_set():
+            try:
+                consumer = self._create_consumer()
+                break
+            except Exception as exc:
+                logger.warning(
+                    "Kafka broker connection failed (%s); retrying in %.1f seconds.",
+                    exc,
+                    retry_delay,
+                )
+                if stop_event is not None:
+                    if stop_event.wait(retry_delay):
+                        return
+                else:
+                    time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 30.0)
+
+        if consumer is None:
+            return
+
         logger.info(
             "Connected to Kafka broker %s; subscribed to %s and %s",
             self.broker,
@@ -128,8 +162,18 @@ class KafkaMarketDataConsumer:
             config.KAFKA_TOPIC_NEWS,
         )
         try:
-            for message in consumer:
-                self.process_message(message)
-                consumer.commit()
+            if stop_event is None:
+                for message in consumer:
+                    self.process_message(message)
+                    consumer.commit()
+            else:
+                while not stop_event.is_set():
+                    records = consumer.poll(timeout_ms=500)
+                    for messages in records.values():
+                        for message in messages:
+                            if stop_event.is_set():
+                                return
+                            self.process_message(message)
+                            consumer.commit()
         finally:
             consumer.close()

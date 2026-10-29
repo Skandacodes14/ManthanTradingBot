@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from threading import Event, Lock, Thread, current_thread
 from typing import Protocol
 
@@ -25,7 +27,7 @@ class StageMonitor:
         self,
         api_client: StageAPIClient,
         *,
-        poll_interval: float = 2.0,
+        poll_interval: float = 10.0,
     ) -> None:
         if not math.isfinite(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be finite and positive")
@@ -134,9 +136,48 @@ class StageMonitor:
             thread.join(timeout)
 
     def _run(self) -> None:
+        consecutive_failures = 0
         while not self.stop_event.is_set():
             try:
                 self.poll_once()
-            except Exception:
-                logger.exception("Failed to poll platform stage; dispatch remains paused")
-            self.stop_event.wait(self.poll_interval)
+                consecutive_failures = 0
+                delay = self.poll_interval
+            except Exception as exc:
+                consecutive_failures += 1
+                backoff = min(
+                    60.0,
+                    self.poll_interval * (2 ** min(consecutive_failures, 3)),
+                )
+                retry_after = self._retry_after_seconds(exc)
+                delay = max(backoff, retry_after or 0.0)
+                logger.warning(
+                    "Failed to poll platform stage (%s); dispatch remains paused. "
+                    "Retrying in %.1f seconds.",
+                    exc,
+                    delay,
+                )
+            self.stop_event.wait(delay)
+
+    @staticmethod
+    def _retry_after_seconds(error: Exception) -> float | None:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if not headers:
+            return None
+
+        value = headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if not math.isfinite(delay):
+            return None
+        return max(0.0, delay)
