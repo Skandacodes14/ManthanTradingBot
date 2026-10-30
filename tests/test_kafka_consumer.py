@@ -42,6 +42,23 @@ class KafkaPreflightHeartbeatTests(unittest.TestCase):
             FakeMarketState(),
         )
 
+    def test_consumer_accepts_fetch_frames_larger_than_one_megabyte(self) -> None:
+        consumer_config: dict[str, Any] = {}
+
+        def consumer_factory(*args: Any, **kwargs: Any) -> Any:
+            self.assertEqual(
+                args,
+                (config.KAFKA_TOPIC_TICKS, config.KAFKA_TOPIC_NEWS),
+            )
+            consumer_config.update(kwargs)
+            return self.consumer
+
+        self.consumer.consumer_factory = consumer_factory
+
+        self.consumer._create_consumer()
+
+        self.assertEqual(consumer_config["receive_message_max_bytes"], 100_000_000)
+
     def test_preflight_event_acknowledges_top_level_sequence(self) -> None:
         self.consumer.process_message(
             FakeMessage({"event_type": "preflight_tick", "seq": 17})
