@@ -160,6 +160,26 @@ class APIClientHeartbeatTests(unittest.TestCase):
         )
         self.assertEqual(response, {"status": "Ready"})
 
+    def test_get_bot_status_queries_endpoint(self) -> None:
+        session = FakeSession({"status": "ok", "is_ready": True})
+        client = APIClient(
+            base_url="https://gateway.example/api/v1",
+            token="test-token",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        response = client.get_bot_status()
+
+        self.assertEqual(
+            session.request_args,
+            ("GET", "https://gateway.example/api/v1/bot/status"),
+        )
+        self.assertEqual(
+            session.request_kwargs["headers"],
+            config.get_auth_headers("test-token"),
+        )
+        self.assertEqual(response, {"status": "ok", "is_ready": True})
+
 
 if __name__ == "__main__":
     unittest.main()

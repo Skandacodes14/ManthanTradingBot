@@ -44,6 +44,33 @@ class StageMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.dispatch_enabled_event.is_set())
         self.assertTrue(monitor.completed_event.is_set())
 
+    def test_preflight_transition_invokes_on_preflight_and_heartbeat(self) -> None:
+        class HeartbeatAPIClient(FakeAPIClient):
+            def __init__(self, *responses: StageStatus | Exception) -> None:
+                super().__init__(*responses)
+                self.heartbeats: list[int] = []
+
+            def post_heartbeat(self, seq: int) -> None:
+                self.heartbeats.append(seq)
+
+        preflight_triggered: list[bool] = []
+        api = HeartbeatAPIClient(
+            StageStatus(stage="development", status="IDLE"),
+            StageStatus(stage="preflight", status="RUNNING"),
+        )
+        monitor = StageMonitor(
+            api,
+            on_preflight=lambda: preflight_triggered.append(True),
+            heartbeat_interval=0.0,
+        )
+        monitor.poll_once()
+        self.assertEqual(preflight_triggered, [])
+        self.assertEqual(api.heartbeats, [1])
+
+        monitor.poll_once()
+        self.assertEqual(preflight_triggered, [True])
+        self.assertEqual(api.heartbeats, [1, 1])
+
     def test_poll_failure_is_recorded_and_fails_closed_for_dispatch(self) -> None:
         expected_error = OSError("gateway unavailable")
         monitor = StageMonitor(

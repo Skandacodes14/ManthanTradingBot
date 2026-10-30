@@ -223,6 +223,66 @@ class TradingBotTests(unittest.TestCase):
 
         self.assertEqual(len(api.orders), 1)
 
+    def test_discover_universe_builds_dynamic_stocks_and_descriptions(self) -> None:
+        class UniverseAPI(FakeAPIClient):
+            def get_stocks(self) -> list[object]:
+                return [
+                    type("Stock", (), {
+                        "ticker": "AERX",
+                        "symbol": "AERX",
+                        "name": "Aero Corp",
+                        "description": "Aerospace defense systems",
+                    })(),
+                    type("Stock", (), {
+                        "ticker": "BLUX",
+                        "symbol": "BLUX",
+                        "name": "BlueMatrix",
+                        "description": "Enterprise cloud systems",
+                    })(),
+                ]
+
+        api = UniverseAPI()
+        bot = TradingBot(api, market_state=MarketState(), stage_monitor=StageMonitor(api))
+        stocks = bot.discover_universe()
+
+        self.assertEqual(len(stocks), 2)
+        self.assertEqual(bot.tickers, {"AERX", "BLUX"})
+        self.assertIn("AERX", bot.stocks)
+        self.assertEqual(bot.stocks["AERX"].description, "Aerospace defense systems")
+
+    def test_on_preflight_active_triggers_dynamic_universe_discovery(self) -> None:
+        class PreflightUniverseAPI(FakeAPIClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.call_count = 0
+
+            def get_stocks(self) -> list[object]:
+                self.call_count += 1
+                return [type("Stock", (), {"ticker": "XYZ", "description": "XYZ Tech"})()]
+
+        api = PreflightUniverseAPI()
+        bot = TradingBot(api, market_state=MarketState(), stage_monitor=StageMonitor(api))
+        self.assertFalse(bot._preflight_universe_loaded)
+
+        bot.on_preflight_active()
+        self.assertTrue(bot._preflight_universe_loaded)
+        self.assertEqual(bot.tickers, {"XYZ"})
+        self.assertEqual(api.call_count, 1)
+
+        # Repeated preflight trigger does not re-discover unnecessarily
+        bot.on_preflight_active()
+        self.assertEqual(api.call_count, 1)
+
+    def test_on_tick_skips_tickers_not_in_dynamic_universe(self) -> None:
+        api = FakeAPIClient()
+        bot = self.create_bot(api)
+        bot.tickers = {"XYZ"}
+        self.seed_prices(bot, [100.0] * 20)
+
+        # Tick for non-universe ticker 'ABC' is ignored
+        bot.on_tick(candle("ABC", "2026-01-21", 101.0))
+        self.assertEqual(api.orders, [])
+
 
 if __name__ == "__main__":
     unittest.main()

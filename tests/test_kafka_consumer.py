@@ -86,6 +86,43 @@ class KafkaPreflightHeartbeatTests(unittest.TestCase):
 
         self.assertEqual(self.api_client.acknowledged_sequences, [17])
 
+    def test_continuous_preflight_heartbeat_is_acknowledged_after_cooldown(self) -> None:
+        clock = 100.0
+
+        def fake_monotonic() -> float:
+            return clock
+
+        consumer = KafkaMarketDataConsumer(
+            self.api_client,
+            FakeMarketState(),
+            monotonic=fake_monotonic,
+            heartbeat_cooldown=2.0,
+        )
+        message = FakeMessage({"event_type": "preflight_tick", "seq": 17})
+
+        consumer.process_message(message)
+        self.assertEqual(self.api_client.acknowledged_sequences, [17])
+
+        # Immediate duplicate should be suppressed
+        consumer.process_message(message)
+        self.assertEqual(self.api_client.acknowledged_sequences, [17])
+
+        # After cooldown (e.g. 3 seconds later), continuous acknowledgment must fire
+        clock += 3.0
+        consumer.process_message(message)
+        self.assertEqual(self.api_client.acknowledged_sequences, [17, 17])
+
+    def test_preflight_event_invokes_on_preflight_callback(self) -> None:
+        preflight_seqs: list[int] = []
+        consumer = KafkaMarketDataConsumer(
+            self.api_client,
+            FakeMarketState(),
+            on_preflight=lambda seq: preflight_seqs.append(seq),
+        )
+        consumer.process_message(FakeMessage({"event_type": "preflight_tick", "seq": 42}))
+
+        self.assertEqual(preflight_seqs, [42])
+
     def test_preflight_sequence_is_retried_if_acknowledgement_fails(self) -> None:
         class FailingOnceAPIClient(FakeAPIClient):
             def __init__(self) -> None:
