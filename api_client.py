@@ -84,6 +84,13 @@ class APIClient:
         """Acknowledge the latest preflight heartbeat sequence."""
         return self._request("POST", "/bot/heartbeat", json={"seq": seq})
 
+    def get_bot_status(self) -> dict[str, Any]:
+        """Return the current bot connection and preflight readiness status."""
+        payload = self._request("GET", "/bot/status")
+        if not isinstance(payload, dict):
+            raise ValueError("Expected an object in bot status API response.")
+        return payload
+
     def get_stocks(self) -> list[StockInfo]:
         """Return the stocks available for trading."""
         payload = self._request("GET", "/stocks")

@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import logging
 import math
-from threading import Event
+from threading import Event, Lock
 import time
 from typing import Any, Protocol
 
@@ -14,7 +14,7 @@ import config
 from api_client import APIClient
 from kafka_consumer import KafkaMarketDataConsumer
 from market_state import MarketState
-from models import NewsFlash, OrderRequest, Position, PriceTick
+from models import NewsFlash, OrderRequest, Position, PriceTick, StockInfo
 from news_sentiment import analyze_news
 from order_manager import OrderManager, OrderRejectedError
 from risk_manager import RiskManager
@@ -211,8 +211,18 @@ class TradingBot:
         self.api_client = api_client if api_client is not None else APIClient()
         self.market_state = market_state if market_state is not None else MarketState()
         self.risk_manager = risk_manager if risk_manager is not None else RiskManager()
+        self._universe_lock = Lock()
+        self.stocks: dict[str, Any] = {}
+        self.tickers: set[str] = set()
+        self._preflight_universe_loaded = False
+
         self.stage_monitor = (
-            stage_monitor if stage_monitor is not None else StageMonitor(self.api_client)
+            stage_monitor
+            if stage_monitor is not None
+            else StageMonitor(
+                self.api_client,
+                on_preflight=self.on_preflight_active,
+            )
         )
         self.order_manager = (
             order_manager
@@ -225,15 +235,79 @@ class TradingBot:
         self.consumer = (
             consumer
             if consumer is not None
-            else KafkaMarketDataConsumer(self.api_client, self)
+            else KafkaMarketDataConsumer(
+                self.api_client,
+                self,
+                on_preflight=self.on_preflight_tick,
+            )
         )
         self._monotonic = monotonic
         self._account: AccountSnapshot | None = None
         self._last_order_date: dict[str, str] = {}
         self._last_tick_date: dict[str, str] = {}
 
+    def discover_universe(self, force: bool = False) -> list[Any]:
+        """Dynamically load simulation stocks via GET /api/v1/stocks and warm up historical data.
+
+        Technical Specification: Pre-flight readiness and dynamic ticker universe.
+        Builds bot's ticker universe dynamically from response instead of hard-coding symbols.
+        """
+        with self._universe_lock:
+            if self.tickers and not force:
+                return list(self.stocks.values())
+
+            logger.info("Calling GET /api/v1/stocks to build ticker universe dynamically...")
+            raw_stocks = self.api_client.get_stocks()
+            if not raw_stocks:
+                raise RuntimeError("The gateway returned no tradable stocks.")
+
+            stocks_map: dict[str, Any] = {}
+            for item in raw_stocks:
+                if isinstance(item, StockInfo):
+                    stocks_map[item.ticker] = item
+                elif isinstance(item, dict):
+                    info = StockInfo.from_dict(item)
+                    stocks_map[info.ticker] = info
+                elif hasattr(item, "ticker"):
+                    stocks_map[item.ticker] = item
+
+            self.stocks = stocks_map
+            self.tickers = set(self.stocks.keys())
+
+            logger.info("Dynamic ticker universe initialized with %d stocks:", len(self.tickers))
+            for ticker in sorted(self.tickers):
+                info = self.stocks[ticker]
+                desc = getattr(info, "description", "")
+                name = getattr(info, "name", ticker)
+                desc_snippet = (desc[:75] + "...") if len(desc) > 75 else desc
+                logger.info("  [%s] %s - %s", ticker, name, desc_snippet)
+
+            tickers = sorted(self.tickers)
+            self.market_state.bootstrap_history(self.api_client, tickers)
+            logger.info("Loaded historical data for %d dynamic universe stocks.", len(tickers))
+            return raw_stocks
+
+    def on_preflight_active(self) -> None:
+        """Called when pre-flight stage becomes active."""
+        if not self._preflight_universe_loaded:
+            logger.info(
+                "Pre-flight stage active: querying GET /api/v1/stocks and building dynamic universe..."
+            )
+            try:
+                self.discover_universe(force=True)
+                self._preflight_universe_loaded = True
+            except Exception:
+                logger.exception("Failed to build stock universe during pre-flight activation.")
+
+    def on_preflight_tick(self, seq: int) -> None:
+        """Called when a preflight_tick standby ping is received from Kafka."""
+        if hasattr(self.stage_monitor, "latest_seq"):
+            self.stage_monitor.latest_seq = seq
+        if not self._preflight_universe_loaded:
+            self.on_preflight_active()
+
     def run(self) -> None:
-        """Validate setup, warm market history, then consume until stopped."""
+        """Validate setup, build dynamic universe, then consume until stopped."""
         errors = config.config.validate()
         if errors:
             raise RuntimeError("Invalid bot configuration: " + "; ".join(errors))
@@ -244,12 +318,10 @@ class TradingBot:
                 logger.info("Simulation is already complete; nothing to run.")
                 return
 
-            stocks = self.api_client.get_stocks()
-            if not stocks:
-                raise RuntimeError("The gateway returned no tradable stocks.")
-            tickers = [stock.ticker for stock in stocks]
-            self.market_state.bootstrap_history(self.api_client, tickers)
-            logger.info("Loaded history for %d stocks.", len(tickers))
+            # Dynamically build the stock universe from GET /api/v1/stocks before market ticks
+            self.discover_universe(force=status.is_preflight)
+            if status.is_preflight:
+                self._preflight_universe_loaded = True
 
             self.stage_monitor.start()
             logger.info(
@@ -265,7 +337,7 @@ class TradingBot:
 
     def on_news(self, news: NewsFlash) -> None:
         """Cache a news event for use with its ticker's next price tick."""
-        logger.debug("Received news for %s: %s", news.ticker, news.headline[:80])
+        logger.info("News: %s | %s", news.ticker, news.headline[:75])
         self.market_state.on_news(news)
 
     def on_tick(self, tick: PriceTick) -> None:
@@ -273,8 +345,12 @@ class TradingBot:
         received_at = self._monotonic()
         self.market_state.on_tick(tick)
         ticker = tick.ticker.strip().upper()
+        if self.tickers and ticker not in self.tickers:
+            logger.debug("Skipping tick for non-universe ticker %s.", ticker)
+            return
+
         date = tick.simulated_date.strip()
-        logger.debug("Tick received: %s @ %.2f on %s", ticker, tick.close, date)
+        logger.info("Tick: %-10s Close=%8.2f  Date=%s", ticker, tick.close, date)
         self._advance_position_age(ticker, date)
 
         if not self.stage_monitor.dispatch_enabled_event.is_set():
@@ -436,6 +512,9 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Suppress verbose internal protocol negotiation logs from kafka and urllib3
+    logging.getLogger("kafka").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
     bot = TradingBot()
     try:
         bot.run()

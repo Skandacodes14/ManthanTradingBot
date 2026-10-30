@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from threading import Event, Lock, Thread, current_thread
@@ -27,13 +29,17 @@ class StageMonitor:
         self,
         api_client: StageAPIClient,
         *,
-        poll_interval: float = 10.0,
+        poll_interval: float = 2.0,
+        on_preflight: Callable[[], None] | None = None,
+        heartbeat_interval: float = 5.0,
     ) -> None:
         if not math.isfinite(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be finite and positive")
 
         self.api_client = api_client
         self.poll_interval = poll_interval
+        self.on_preflight = on_preflight
+        self.heartbeat_interval = heartbeat_interval
         self.preflight_event = Event()
         self.simulation_running_event = Event()
         self.dispatch_enabled_event = Event()
@@ -45,6 +51,8 @@ class StageMonitor:
         self._status: StageStatus | None = None
         self._last_error: Exception | None = None
         self._thread: Thread | None = None
+        self._last_heartbeat_time: float = 0.0
+        self.latest_seq: int = 1
 
     @property
     def status(self) -> StageStatus | None:
@@ -101,6 +109,35 @@ class StageMonitor:
                     status.stage,
                     status.status,
                 )
+
+            # Trigger dynamic universe discovery when preflight becomes active
+            if status.is_preflight:
+                if (previous is None or not previous.is_preflight) and self.on_preflight is not None:
+                    try:
+                        self.on_preflight()
+                    except Exception:
+                        logger.exception("Failed during stage monitor on_preflight callback.")
+
+            # Keep-alive heartbeat: send continuous ACK while bot is running to pass pre-flight readiness check
+            now = time.monotonic()
+            if (
+                not status.is_completed
+                and hasattr(self.api_client, "post_heartbeat")
+                and (now - self._last_heartbeat_time >= self.heartbeat_interval)
+            ):
+                try:
+                    self.api_client.post_heartbeat(self.latest_seq)
+                    self._last_heartbeat_time = now
+                    logger.info(
+                        "Continuous pre-flight heartbeat ACK sent (seq=%s, stage=%s)",
+                        self.latest_seq,
+                        status.stage,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Continuous pre-flight heartbeat failed (%s)",
+                        exc,
+                    )
         return status
 
     @staticmethod

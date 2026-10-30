@@ -336,12 +336,13 @@ class StockInfo:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "StockInfo":
-        ticker = str(data.get("ticker", "")).strip().upper()
+        ticker = str(data.get("ticker") or data.get("symbol") or "").strip().upper()
+        symbol = str(data.get("symbol") or data.get("ticker") or "").strip().upper()
         if not ticker:
             raise ValueError("Stock record is missing a ticker.")
         return cls(
             ticker=ticker,
-            symbol=str(data.get("symbol", "")).strip().upper(),
+            symbol=symbol,
             name=str(data.get("name", "")).strip(),
             description=str(data.get("description", "")).strip(),
         )
