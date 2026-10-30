@@ -83,9 +83,17 @@ class KafkaMarketDataConsumer:
             config.KAFKA_TOPIC_NEWS,
             bootstrap_servers=[self.broker],
             group_id=self.group_id,
-            auto_offset_reset="latest",
+            auto_offset_reset="earliest",
             enable_auto_commit=False,
+            receive_message_max_bytes=100_000_000,
             value_deserializer=_deserialize_json,
+            session_timeout_ms=30000,
+            heartbeat_interval_ms=10000,
+            max_poll_interval_ms=300000,
+            reconnect_backoff_ms=500,
+            reconnect_backoff_max_ms=30000,
+            retry_backoff_ms=500,
+            request_timeout_ms=40000,
         )
 
     def process_message(self, message: KafkaMessage) -> None:
@@ -164,16 +172,30 @@ class KafkaMarketDataConsumer:
         try:
             if stop_event is None:
                 for message in consumer:
-                    self.process_message(message)
+                    try:
+                        self.process_message(message)
+                    except Exception:
+                        logger.exception(
+                            "Error processing Kafka message on topic=%s; skipping.",
+                            message.topic,
+                        )
                     consumer.commit()
             else:
                 while not stop_event.is_set():
                     records = consumer.poll(timeout_ms=500)
+                    if not records:
+                        continue
                     for messages in records.values():
                         for message in messages:
                             if stop_event.is_set():
                                 return
-                            self.process_message(message)
+                            try:
+                                self.process_message(message)
+                            except Exception:
+                                logger.exception(
+                                    "Error processing Kafka message on topic=%s; skipping.",
+                                    message.topic,
+                                )
                             consumer.commit()
         finally:
             consumer.close()

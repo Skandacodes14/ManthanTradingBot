@@ -252,6 +252,12 @@ class TradingBot:
             logger.info("Loaded history for %d stocks.", len(tickers))
 
             self.stage_monitor.start()
+            logger.info(
+                "Entering Kafka consume loop (stage=%s, status=%s). "
+                "Waiting for market events...",
+                status.stage,
+                status.status,
+            )
             self.consumer.run(stop_event=self.stage_monitor.completed_event)
         finally:
             self.stage_monitor.stop(timeout=5.0)
@@ -259,6 +265,7 @@ class TradingBot:
 
     def on_news(self, news: NewsFlash) -> None:
         """Cache a news event for use with its ticker's next price tick."""
+        logger.debug("Received news for %s: %s", news.ticker, news.headline[:80])
         self.market_state.on_news(news)
 
     def on_tick(self, tick: PriceTick) -> None:
@@ -267,14 +274,26 @@ class TradingBot:
         self.market_state.on_tick(tick)
         ticker = tick.ticker.strip().upper()
         date = tick.simulated_date.strip()
+        logger.debug("Tick received: %s @ %.2f on %s", ticker, tick.close, date)
         self._advance_position_age(ticker, date)
 
         if not self.stage_monitor.dispatch_enabled_event.is_set():
+            logger.debug(
+                "Dispatch not enabled (stage not in running simulation); "
+                "tick for %s on %s cached but no order attempted.",
+                ticker,
+                date,
+            )
             return
         if self._last_order_date.get(ticker) == date:
             return
 
-        account = self._account_snapshot()
+        try:
+            account = self._account_snapshot()
+        except Exception:
+            logger.exception("Failed to load account snapshot; skipping tick for %s.", ticker)
+            return
+
         position = account.positions.get(ticker)
         if position is not None:
             exit_action = self.risk_manager.monitor_position(position, tick.close)
